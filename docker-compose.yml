@@ -1,0 +1,71 @@
+x-go: &go
+  image: ghcr.io/vinicius-piassa/rinha-backend-2026-go:latest
+  platform: linux/amd64
+  restart: unless-stopped
+  ulimits:
+    memlock: -1
+    nofile:
+      soft: 65535
+      hard: 65535
+
+services:
+  api1:
+    <<: *go
+    cpuset: "0"
+    command:
+      - /server
+      - /sockets/api1.sock
+      - /index
+    working_dir: /
+    volumes:
+      - sockets:/sockets
+    deploy:
+      resources:
+        limits:
+          cpus: "0.475"
+          memory: "171MB"
+
+  api2:
+    <<: *go
+    cpuset: "1"
+    command:
+      - /server
+      - /sockets/api2.sock
+      - /index
+    working_dir: /
+    volumes:
+      - sockets:/sockets
+    deploy:
+      resources:
+        limits:
+          cpus: "0.475"
+          memory: "171MB"
+
+  lb:
+    <<: *go
+    cpuset: "2,3"
+    command:
+      - /lb
+      - "9999"
+      - /sockets/api1.sock
+      - /sockets/api2.sock
+    ports:
+      - "9999:9999"
+    volumes:
+      - sockets:/sockets
+    depends_on:
+      - api1
+      - api2
+    deploy:
+      resources:
+        limits:
+          cpus: "0.05"
+          memory: "8MB"
+
+volumes:
+  sockets:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=4m,mode=0777

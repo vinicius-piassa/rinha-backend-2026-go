@@ -1,0 +1,5 @@
+*.test
+/server
+/lb
+/build_index
+perf.data
