@@ -82,10 +82,13 @@ func main() {
 	}
 
 	tk := time.Now()
-	_, assignments := index.KMeans(refs, kmeansIters)
+	cent, assignments := index.KMeans(refs, kmeansIters)
 	log("k-means done (%.1fs)", time.Since(tk).Seconds())
 
 	offsets, order := index.CountingSortByCluster(assignments)
+	// Order each cluster's vectors nearest-centroid-first so the runtime scan
+	// stabilizes the top-5 early and the early-termination gate prunes more.
+	index.SortWithinClusters(refs, cent, assignments, offsets, order)
 	bboxMin, bboxMax, pairArr, labels := index.BBoxPack(refs, order, offsets)
 
 	if err := index.WriteIndexBin(outPath, len(refs), offsets, bboxMin, bboxMax, pairArr, labels); err != nil {

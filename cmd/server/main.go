@@ -142,12 +142,15 @@ func handleRequest(req []byte, bodyOff int) []byte {
 func sendAll(fd int, p []byte) error {
 	off := 0
 	for off < len(p) {
-		n, err := unix.SendmsgN(fd, p[off:], nil, nil, unix.MSG_NOSIGNAL)
-		if err == unix.EINTR {
+		n, errno := sendRaw(fd, p[off:])
+		if errno == unix.EINTR {
 			continue
 		}
-		if err != nil {
-			return err
+		if errno == unix.EAGAIN || errno == unix.EWOULDBLOCK {
+			continue // socket buffer momentarily full; retry (rare for tiny resp)
+		}
+		if errno != 0 {
+			return errno
 		}
 		off += n
 	}
@@ -173,7 +176,10 @@ func closeClient(fd int) {
 }
 
 // contentLength scans header bytes for "content-length:" (case-insensitive)
-// and returns its value, or -1 if absent. Allocation-free.
+// and returns its value, or -1 if absent. Allocation-free. The value is capped
+// at bufSize+1 so a hostile/overflowing Content-Length can never produce a
+// negative or out-of-range total downstream (the caller rejects anything that
+// doesn't fit the buffer anyway).
 func contentLength(hdr []byte) int {
 	i := indexFold(hdr, clKey)
 	if i < 0 {
@@ -186,6 +192,9 @@ func contentLength(hdr []byte) int {
 	n := 0
 	for j < len(hdr) && hdr[j] >= '0' && hdr[j] <= '9' {
 		n = n*10 + int(hdr[j]-'0')
+		if n > bufSize { // clamp: larger than the buffer is rejected anyway
+			return bufSize + 1
+		}
 		j++
 	}
 	return n
@@ -217,10 +226,23 @@ func indexFold(hay, needle []byte) int {
 }
 
 // recvNB does a non-blocking recvfrom with a NULL source address, avoiding the
-// per-call sockaddr allocation that unix.Recvfrom incurs.
+// per-call sockaddr allocation that unix.Recvfrom incurs. Uses RawSyscall6:
+// MSG_DONTWAIT means the call returns immediately, so the entersyscall/
+// exitsyscall scheduler bookkeeping that unix.Syscall6 adds is pure overhead
+// on the hot path (and would let the runtime migrate us off the FIFO thread).
 func recvNB(fd int, p []byte) (int, unix.Errno) {
-	r0, _, e := unix.Syscall6(unix.SYS_RECVFROM, uintptr(fd),
+	r0, _, e := unix.RawSyscall6(unix.SYS_RECVFROM, uintptr(fd),
 		uintptr(unsafe.Pointer(&p[0])), uintptr(len(p)), uintptr(unix.MSG_DONTWAIT), 0, 0)
+	return int(r0), e
+}
+
+// sendRaw is a non-blocking-ish sendto via RawSyscall6 (NULL dest = send()).
+// The response is tiny (<128 B) and the socket buffer is far larger, so the
+// send completes without blocking in practice — RawSyscall avoids the
+// scheduler round-trip per response.
+func sendRaw(fd int, p []byte) (int, unix.Errno) {
+	r0, _, e := unix.RawSyscall6(unix.SYS_SENDTO, uintptr(fd),
+		uintptr(unsafe.Pointer(&p[0])), uintptr(len(p)), uintptr(unix.MSG_NOSIGNAL), 0, 0)
 	return int(r0), e
 }
 
@@ -251,6 +273,10 @@ func handleClientEvent(fd int) {
 			cl = 0
 		}
 		total := bodyOff + cl
+		if total > bufSize {
+			closeClient(fd) // request can't fit the buffer — drop it
+			return
+		}
 		if st.pos < total {
 			return // body incomplete — wait for more
 		}
@@ -282,6 +308,11 @@ func handleCtrlEvent() {
 			unix.Close(fd) // out of state range — reject
 			continue
 		}
+		// Re-apply on the fd received via SCM_RIGHTS: NODELAY so the response
+		// isn't held by Nagle, QUICKACK so the first response skips the
+		// delayed-ACK window (these don't survive the fd handoff).
+		unix.SetsockoptInt(fd, unix.SOL_TCP, unix.TCP_NODELAY, 1)
+		unix.SetsockoptInt(fd, unix.SOL_TCP, unix.TCP_QUICKACK, 1)
 		states[fd].pos = 0
 		unix.EpollCtl(epollFD, unix.EPOLL_CTL_ADD, fd,
 			&unix.EpollEvent{Events: epollIn | epollRdhup, Fd: int32(fd)})
@@ -289,6 +320,16 @@ func handleCtrlEvent() {
 }
 
 func serverLoop() {
+	// Pin this goroutine to its OS thread and raise THAT thread to SCHED_FIFO,
+	// so the event loop is never migrated to a SCHED_OTHER thread (which would
+	// add wake-up jitter to the p99 tail). Mirrors the asm's single-thread model.
+	// SCHED_FIFO is gated: on a loaded/shared host it can starve the runtime;
+	// on the dedicated benchmark host it's a clean win. NO_FIFO=1 disables it.
+	runtime.LockOSThread()
+	if os.Getenv("NO_FIFO") == "" {
+		setRealtimePriority()
+	}
+
 	events := make([]unix.EpollEvent, maxEvents)
 	for {
 		n, err := unix.EpollWait(epollFD, events, 1) // 1ms; kernel busy-polls 50µs first
@@ -337,7 +378,8 @@ func main() {
 
 	unix.Prctl(unix.PR_SET_TIMERSLACK, 1, 0, 0, 0)
 	unix.Mlockall(unix.MCL_CURRENT | unix.MCL_FUTURE)
-	setRealtimePriority()
+	// SCHED_FIFO is set inside serverLoop, after LockOSThread, so it lands on the
+	// thread that actually runs the event loop.
 
 	states = make([]connState, maxFDs)
 

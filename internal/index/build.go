@@ -3,6 +3,7 @@ package index
 import (
 	"math"
 	"runtime"
+	"sort"
 	"sync"
 
 	"simd/archsimd"
@@ -167,6 +168,26 @@ func KMeans(refs []Ref, iters int) (cent *Centroids, assignments []int32) {
 		}
 	}
 	return cent, assignments
+}
+
+// SortWithinClusters reorders each cluster's slice of `order` so that vectors
+// closest to their centroid come first. The runtime scan walks a cluster
+// sequentially, so front-loading the near vectors makes the top-5 (and thus
+// the fraud count) stabilize early — tightening worst_key sooner, which lets
+// the scan_cluster early-termination gate prune more batches. Pure ordering
+// change: the exact k-NN result is identical, only the work to reach it drops.
+func SortWithinClusters(refs []Ref, cent *Centroids, assignments []int32, offsets, order []uint32) {
+	for c := 0; c < NClusters; c++ {
+		lo, hi := offsets[c], offsets[c+1]
+		if hi-lo < 2 {
+			continue
+		}
+		seg := order[lo:hi]
+		ctr := &cent[c]
+		sort.Slice(seg, func(i, j int) bool {
+			return l2sqF32(&refs[seg[i]].V, ctr) < l2sqF32(&refs[seg[j]].V, ctr)
+		})
+	}
 }
 
 // CountingSortByCluster returns the prefix-sum offsets (len K+1) and the order
