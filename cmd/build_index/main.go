@@ -81,10 +81,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	// K scales with partition size (~600 vectors/cluster), clamped to
-	// [64, 2048]. Measured to cut search 40-70% on small/medium partitions vs a
-	// fixed K=2048, while keeping the exact k-NN result.
-	k := len(refs) / 600
+	// K scales with partition size, clamped to [64, 2048]. Measured optimum:
+	// small partitions want few clusters (phase-1 cost dominates → floor 64),
+	// large partitions want many (per-cluster scan dominates → cap 2048). The
+	// /300 target lands medium partitions in the measured flat optimum and
+	// drives partitions above ~600K to the 2048 cap (where they're fastest).
+	// Exact regardless of K; only the work to reach the verdict changes.
+	k := len(refs) / 300
 	if k < 64 {
 		k = 64
 	}
