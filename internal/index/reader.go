@@ -73,8 +73,8 @@ func Open(path string) (*IvfIndex, error) {
 		return nil, fmt.Errorf("index: bad magic in %s", path)
 	}
 	nc := int(binary.LittleEndian.Uint32(data[8:12]))
-	if nc != NClusters {
-		return nil, fmt.Errorf("index: n_clusters=%d, want %d", nc, NClusters)
+	if nc < 1 || nc > NClusters {
+		return nil, fmt.Errorf("index: n_clusters=%d, want 1..%d", nc, NClusters)
 	}
 	nv := int(binary.LittleEndian.Uint32(data[12:16]))
 

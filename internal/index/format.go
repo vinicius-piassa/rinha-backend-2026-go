@@ -76,7 +76,7 @@ func WriteIndexBin(
 
 	var hdr [64]byte
 	copy(hdr[0:8], magic)
-	binary.LittleEndian.PutUint32(hdr[8:12], NClusters)
+	binary.LittleEndian.PutUint32(hdr[8:12], uint32(len(clusterOffsets)-1)) // actual K
 	binary.LittleEndian.PutUint32(hdr[12:16], uint32(n))
 	if err := writePadded(w, hdr[:]); err != nil {
 		return err

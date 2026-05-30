@@ -91,21 +91,30 @@ func l2sqF32(a, b *[16]float32) float32 {
 }
 
 // Centroids is K rows of 16 floats (lanes 14,15 = 0).
-type Centroids [NClusters][16]float32
+// Centroids holds k rows of 16 floats (lanes 14,15 = 0). Sized at build time so
+// the cluster count K can be chosen per partition (smaller K for smaller
+// partitions — measured to cut search 40-70% vs a fixed K=2048).
+type Centroids [][16]float32
 
-// KMeans runs Lloyd's algorithm with deterministic evenly-spaced init, writing
-// the final assignment of every ref into assignments (len n). The assign phase
-// is parallelized across cores (this is an offline tool).
-func KMeans(refs []Ref, iters int) (cent *Centroids, assignments []int32) {
+// KMeans runs Lloyd's algorithm with deterministic evenly-spaced init over k
+// clusters, writing the final assignment of every ref into assignments (len n).
+// The assign phase is parallelized across cores (this is an offline tool).
+func KMeans(refs []Ref, k, iters int) (cent Centroids, assignments []int32) {
 	n := len(refs)
-	cent = new(Centroids)
+	if k > n {
+		k = n
+	}
+	if k < 1 {
+		k = 1
+	}
+	cent = make(Centroids, k)
 	assignments = make([]int32, n)
 
-	step := n / NClusters
+	step := n / k
 	if step < 1 {
 		step = 1
 	}
-	for c := 0; c < NClusters; c++ {
+	for c := 0; c < k; c++ {
 		src := c * step
 		if src >= n {
 			src = n - 1
@@ -114,6 +123,8 @@ func KMeans(refs []Ref, iters int) (cent *Centroids, assignments []int32) {
 	}
 
 	workers := runtime.NumCPU()
+	sums := make([][NDims]float64, k)
+	counts := make([]uint64, k)
 	for it := 0; it < iters; it++ {
 		// Phase A: assign each ref to its nearest centroid (parallel).
 		var wg sync.WaitGroup
@@ -133,7 +144,7 @@ func KMeans(refs []Ref, iters int) (cent *Centroids, assignments []int32) {
 				for i := lo; i < hi; i++ {
 					best := l2sqF32(&refs[i].V, &cent[0])
 					bestC := int32(0)
-					for c := 1; c < NClusters; c++ {
+					for c := 1; c < k; c++ {
 						if d := l2sqF32(&refs[i].V, &cent[c]); d < best {
 							best = d
 							bestC = int32(c)
@@ -146,8 +157,10 @@ func KMeans(refs []Ref, iters int) (cent *Centroids, assignments []int32) {
 		wg.Wait()
 
 		// Phase B: recompute centroids (double accumulation, then divide).
-		var sums [NClusters][NDims]float64
-		var counts [NClusters]uint64
+		for c := range sums {
+			sums[c] = [NDims]float64{}
+			counts[c] = 0
+		}
 		for i := 0; i < n; i++ {
 			c := assignments[i]
 			counts[c]++
@@ -157,7 +170,7 @@ func KMeans(refs []Ref, iters int) (cent *Centroids, assignments []int32) {
 				row[d] += float64(v[d])
 			}
 		}
-		for c := 0; c < NClusters; c++ {
+		for c := 0; c < k; c++ {
 			if counts[c] == 0 {
 				continue
 			}
@@ -176,8 +189,9 @@ func KMeans(refs []Ref, iters int) (cent *Centroids, assignments []int32) {
 // the fraud count) stabilize early — tightening worst_key sooner, which lets
 // the scan_cluster early-termination gate prune more batches. Pure ordering
 // change: the exact k-NN result is identical, only the work to reach it drops.
-func SortWithinClusters(refs []Ref, cent *Centroids, assignments []int32, offsets, order []uint32) {
-	for c := 0; c < NClusters; c++ {
+func SortWithinClusters(refs []Ref, cent Centroids, assignments []int32, offsets, order []uint32) {
+	k := len(cent)
+	for c := 0; c < k; c++ {
 		lo, hi := offsets[c], offsets[c+1]
 		if hi-lo < 2 {
 			continue
@@ -190,20 +204,20 @@ func SortWithinClusters(refs []Ref, cent *Centroids, assignments []int32, offset
 	}
 }
 
-// CountingSortByCluster returns the prefix-sum offsets (len K+1) and the order
+// CountingSortByCluster returns the prefix-sum offsets (len k+1) and the order
 // slice (len n): order[pos] is the original ref index landing at position pos.
-func CountingSortByCluster(assignments []int32) (offsets []uint32, order []uint32) {
+func CountingSortByCluster(assignments []int32, k int) (offsets []uint32, order []uint32) {
 	n := len(assignments)
-	offsets = make([]uint32, NClusters+1)
+	offsets = make([]uint32, k+1)
 	order = make([]uint32, n)
 	for _, c := range assignments {
 		offsets[c+1]++
 	}
-	for c := 0; c < NClusters; c++ {
+	for c := 0; c < k; c++ {
 		offsets[c+1] += offsets[c]
 	}
-	cursor := make([]uint32, NClusters)
-	copy(cursor, offsets[:NClusters])
+	cursor := make([]uint32, k)
+	copy(cursor, offsets[:k])
 	for i, c := range assignments {
 		order[cursor[c]] = uint32(i)
 		cursor[c]++
@@ -212,12 +226,12 @@ func CountingSortByCluster(assignments []int32) (offsets []uint32, order []uint3
 }
 
 // BBoxPack walks the cluster-ordered refs, computing per-cluster int16 bounding
-// boxes and striping the quantized dims into the 7 SoA pair arrays.
-func BBoxPack(refs []Ref, order, offsets []uint32) (bboxMin, bboxMax []int16, pairArr [NPairs][]int32, labels []uint8) {
+// boxes (k clusters) and striping the quantized dims into the 7 SoA pair arrays.
+func BBoxPack(refs []Ref, order, offsets []uint32, k int) (bboxMin, bboxMax []int16, pairArr [NPairs][]int32, labels []uint8) {
 	n := len(order)
-	bboxMin = make([]int16, NClusters*16)
-	bboxMax = make([]int16, NClusters*16)
-	for c := 0; c < NClusters; c++ {
+	bboxMin = make([]int16, k*16)
+	bboxMax = make([]int16, k*16)
+	for c := 0; c < k; c++ {
 		for lane := 0; lane < NDims; lane++ {
 			bboxMin[c*16+lane] = math.MaxInt16
 			bboxMax[c*16+lane] = math.MinInt16
