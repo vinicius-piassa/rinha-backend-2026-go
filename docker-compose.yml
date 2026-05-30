@@ -1,5 +1,5 @@
 x-go: &go
-  image: ghcr.io/vinicius-piassa/rinha-backend-2026-go:abdddc3
+  image: ghcr.io/vinicius-piassa/rinha-backend-2026-go:43a8d57
   platform: linux/amd64
   restart: unless-stopped
   ulimits:
